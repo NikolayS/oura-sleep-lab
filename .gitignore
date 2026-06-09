@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 data/raw/
 data/private/
+data/tokens/
 reports/*.html
 reports/*.pdf
 reports/*.json

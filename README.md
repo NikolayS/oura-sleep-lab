@@ -42,9 +42,34 @@ For first analysis, the useful scopes are:
 
 - `scripts/` - import and analysis scripts
 - `data/raw/` - local raw Oura exports/API snapshots, ignored by git
+- `data/tokens/` - local OAuth tokens, ignored by git
 - `reports/` - generated reports, ignored by git
+
+## OAuth Helper
+
+Create `.env` from `.env.example` and fill in the Oura OAuth application
+credentials.
+
+Print an authorization URL:
+
+```bash
+python3 scripts/oura_auth.py url
+```
+
+If the browser runs on the same machine:
+
+```bash
+python3 scripts/oura_auth.py listen
+```
+
+If authorizing from another machine, copy the final localhost callback URL from
+the browser address bar and exchange it locally:
+
+```bash
+python3 scripts/oura_auth.py exchange --callback-url 'http://localhost:8765/callback?code=...&state=...'
+```
 
 ## Status
 
-Initial scaffold. Analysis scripts will be added once the data access path is
-chosen.
+Initial scaffold with OAuth helper. Analysis scripts will be added once the
+first Oura data snapshot is available.
