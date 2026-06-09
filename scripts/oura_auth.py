@@ -12,6 +12,7 @@ import json
 import os
 import secrets
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -22,8 +23,14 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 TOKEN_PATH = ROOT / "data" / "tokens" / "oura_token.json"
-AUTHORIZE_URL = "https://cloud.ouraring.com/oauth/authorize"
-TOKEN_URL = "https://api.ouraring.com/oauth/token"
+ISSUER_URL = "https://moi.ouraring.com/oauth/v2/ext/oauth-anonymous"
+DISCOVERY_URL = f"{ISSUER_URL}/.well-known/openid-configuration"
+FALLBACK_AUTHORIZE_URL = "https://cloud.ouraring.com/oauth/authorize"
+FALLBACK_TOKEN_URL = "https://api.ouraring.com/oauth/token"
+DEFAULT_SCOPES = (
+    "extapi:daily extapi:heartrate extapi:spo2 extapi:workout "
+    "extapi:tag extapi:session extapi:personal"
+)
 
 
 def load_env(path: Path = ENV_PATH) -> dict[str, str]:
@@ -41,12 +48,14 @@ def load_env(path: Path = ENV_PATH) -> dict[str, str]:
         "OURA_CLIENT_SECRET",
         "OURA_REDIRECT_URI",
         "OURA_SCOPES",
+        "OURA_AUTHORIZE_URL",
+        "OURA_TOKEN_URL",
     ):
         if os.environ.get(key):
             env[key] = os.environ[key]
 
     env.setdefault("OURA_REDIRECT_URI", "http://localhost:8765/callback")
-    env.setdefault("OURA_SCOPES", "daily heartrate spo2 workout tag session personal")
+    env.setdefault("OURA_SCOPES", DEFAULT_SCOPES)
     return env
 
 
@@ -57,7 +66,36 @@ def require_env(env: dict[str, str]) -> None:
         raise SystemExit(f"Missing {joined}; copy .env.example to .env and fill it in.")
 
 
+def oauth_config(env: dict[str, str]) -> dict[str, str]:
+    if env.get("OURA_AUTHORIZE_URL") and env.get("OURA_TOKEN_URL"):
+        return {
+            "authorization_endpoint": env["OURA_AUTHORIZE_URL"],
+            "token_endpoint": env["OURA_TOKEN_URL"],
+        }
+
+    try:
+        with urllib.request.urlopen(DISCOVERY_URL, timeout=10) as response:
+            data = json.loads(response.read().decode())
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        return {
+            "authorization_endpoint": env.get("OURA_AUTHORIZE_URL", FALLBACK_AUTHORIZE_URL),
+            "token_endpoint": env.get("OURA_TOKEN_URL", FALLBACK_TOKEN_URL),
+        }
+
+    return {
+        "authorization_endpoint": env.get(
+            "OURA_AUTHORIZE_URL",
+            data.get("authorization_endpoint", FALLBACK_AUTHORIZE_URL),
+        ),
+        "token_endpoint": env.get(
+            "OURA_TOKEN_URL",
+            data.get("token_endpoint", FALLBACK_TOKEN_URL),
+        ),
+    }
+
+
 def build_authorize_url(env: dict[str, str], state: str) -> str:
+    config = oauth_config(env)
     query = urllib.parse.urlencode(
         {
             "response_type": "code",
@@ -67,46 +105,63 @@ def build_authorize_url(env: dict[str, str], state: str) -> str:
             "state": state,
         }
     )
-    return f"{AUTHORIZE_URL}?{query}"
+    return f"{config['authorization_endpoint']}?{query}"
+
+
+def post_token_request(env: dict[str, str], payload: dict[str, str]) -> dict[str, Any]:
+    config = oauth_config(env)
+    body = urllib.parse.urlencode(
+        payload
+        | {
+            "client_id": env["OURA_CLIENT_ID"],
+            "client_secret": env["OURA_CLIENT_SECRET"],
+        }
+    ).encode()
+    request = urllib.request.Request(
+        config["token_endpoint"],
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        body_text = error.read().decode(errors="replace")
+        try:
+            error_body = json.loads(body_text)
+        except json.JSONDecodeError:
+            error_body = {"error": body_text}
+        error_name = error_body.get("error") or error_body.get("title") or "oauth_error"
+        description = (
+            error_body.get("error_description")
+            or error_body.get("detail")
+            or "No extra detail from Oura."
+        )
+        raise SystemExit(
+            f"Oura token request failed: HTTP {error.code} {error_name}: {description}"
+        ) from error
 
 
 def exchange_code(env: dict[str, str], code: str) -> dict[str, Any]:
-    body = urllib.parse.urlencode(
+    return post_token_request(
+        env,
         {
             "grant_type": "authorization_code",
             "code": code,
             "redirect_uri": env["OURA_REDIRECT_URI"],
-            "client_id": env["OURA_CLIENT_ID"],
-            "client_secret": env["OURA_CLIENT_SECRET"],
-        }
-    ).encode()
-    request = urllib.request.Request(
-        TOKEN_URL,
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
+        },
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode())
 
 
 def refresh_token(env: dict[str, str], refresh: str) -> dict[str, Any]:
-    body = urllib.parse.urlencode(
+    return post_token_request(
+        env,
         {
             "grant_type": "refresh_token",
             "refresh_token": refresh,
-            "client_id": env["OURA_CLIENT_ID"],
-            "client_secret": env["OURA_CLIENT_SECRET"],
-        }
-    ).encode()
-    request = urllib.request.Request(
-        TOKEN_URL,
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
+        },
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode())
 
 
 def save_token(token: dict[str, Any]) -> None:

@@ -30,13 +30,13 @@ Create an application:
 
 For first analysis, the useful scopes are:
 
-- `daily`
-- `heartrate`
-- `spo2`
-- `workout`
-- `tag`
-- `session`
-- `personal`
+- `extapi:daily`
+- `extapi:heartrate`
+- `extapi:spo2`
+- `extapi:workout`
+- `extapi:tag`
+- `extapi:session`
+- `extapi:personal`
 
 ## Project Shape
 
@@ -55,6 +55,10 @@ Print an authorization URL:
 ```bash
 python3 scripts/oura_auth.py url
 ```
+
+The helper uses Oura's OAuth issuer discovery document by default. If Oura
+changes endpoints again, override with `OURA_AUTHORIZE_URL` and
+`OURA_TOKEN_URL`.
 
 If the browser runs on the same machine:
 
