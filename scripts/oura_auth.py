@@ -8,6 +8,8 @@ simple, and avoiding dependencies keeps the first private analysis portable.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import secrets
@@ -23,6 +25,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 TOKEN_PATH = ROOT / "data" / "tokens" / "oura_token.json"
+OAUTH_STATE_PATH = ROOT / "data" / "tokens" / "oura_oauth_state.json"
 ISSUER_URL = "https://moi.ouraring.com/oauth/v2/ext/oauth-anonymous"
 DISCOVERY_URL = f"{ISSUER_URL}/.well-known/openid-configuration"
 FALLBACK_AUTHORIZE_URL = "https://cloud.ouraring.com/oauth/authorize"
@@ -94,7 +97,32 @@ def oauth_config(env: dict[str, str]) -> dict[str, str]:
     }
 
 
-def build_authorize_url(env: dict[str, str], state: str) -> str:
+def pkce_challenge(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode()).digest()
+    return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+
+def save_oauth_state(state: str, verifier: str) -> None:
+    OAUTH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    current: dict[str, Any] = {}
+    if OAUTH_STATE_PATH.exists():
+        current = json.loads(OAUTH_STATE_PATH.read_text())
+    current[state] = {"code_verifier": verifier}
+    OAUTH_STATE_PATH.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n")
+    OAUTH_STATE_PATH.chmod(0o600)
+
+
+def load_code_verifier(state: str | None) -> str | None:
+    if not state or not OAUTH_STATE_PATH.exists():
+        return None
+    current = json.loads(OAUTH_STATE_PATH.read_text())
+    entry = current.get(state)
+    if not entry:
+        return None
+    return entry.get("code_verifier")
+
+
+def build_authorize_url(env: dict[str, str], state: str, verifier: str) -> str:
     config = oauth_config(env)
     query = urllib.parse.urlencode(
         {
@@ -103,6 +131,8 @@ def build_authorize_url(env: dict[str, str], state: str) -> str:
             "redirect_uri": env["OURA_REDIRECT_URI"],
             "scope": env["OURA_SCOPES"],
             "state": state,
+            "code_challenge": pkce_challenge(verifier),
+            "code_challenge_method": "S256",
         }
     )
     return f"{config['authorization_endpoint']}?{query}"
@@ -143,14 +173,17 @@ def post_token_request(env: dict[str, str], payload: dict[str, str]) -> dict[str
         ) from error
 
 
-def exchange_code(env: dict[str, str], code: str) -> dict[str, Any]:
+def exchange_code(env: dict[str, str], code: str, verifier: str | None = None) -> dict[str, Any]:
+    payload = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": env["OURA_REDIRECT_URI"],
+    }
+    if verifier:
+        payload["code_verifier"] = verifier
     return post_token_request(
         env,
-        {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": env["OURA_REDIRECT_URI"],
-        },
+        payload,
     )
 
 
@@ -170,14 +203,17 @@ def save_token(token: dict[str, Any]) -> None:
     TOKEN_PATH.chmod(0o600)
 
 
-def parse_code_from_url(callback_url: str) -> str:
+def parse_callback_url(callback_url: str) -> dict[str, str]:
     parsed = urllib.parse.urlparse(callback_url)
     params = urllib.parse.parse_qs(parsed.query)
     if params.get("error"):
         raise SystemExit(f"Oura returned error: {params['error'][0]}")
     if not params.get("code"):
         raise SystemExit("No code= parameter found in callback URL.")
-    return params["code"][0]
+    return {
+        "code": params["code"][0],
+        "state": params.get("state", [""])[0],
+    }
 
 
 def run_callback_server(env: dict[str, str], state: str) -> str:
@@ -224,7 +260,9 @@ def command_url(args: argparse.Namespace) -> None:
     env = load_env()
     require_env(env)
     state = args.state or secrets.token_urlsafe(24)
-    print(build_authorize_url(env, state))
+    verifier = secrets.token_urlsafe(64)
+    save_oauth_state(state, verifier)
+    print(build_authorize_url(env, state, verifier))
     print(f"\nstate={state}")
 
 
@@ -232,10 +270,12 @@ def command_listen(args: argparse.Namespace) -> None:
     env = load_env()
     require_env(env)
     state = args.state or secrets.token_urlsafe(24)
-    print(build_authorize_url(env, state))
+    verifier = secrets.token_urlsafe(64)
+    save_oauth_state(state, verifier)
+    print(build_authorize_url(env, state, verifier))
     print("\nOpen that URL in a browser on this machine; waiting for callback...", flush=True)
     code = run_callback_server(env, state)
-    token = exchange_code(env, code)
+    token = exchange_code(env, code, verifier)
     save_token(token)
     print(f"Saved token to {TOKEN_PATH}")
 
@@ -243,8 +283,14 @@ def command_listen(args: argparse.Namespace) -> None:
 def command_exchange(args: argparse.Namespace) -> None:
     env = load_env()
     require_env(env)
-    code = args.code or parse_code_from_url(args.callback_url)
-    token = exchange_code(env, code)
+    if args.callback_url:
+        callback = parse_callback_url(args.callback_url)
+        code = callback["code"]
+        verifier = load_code_verifier(callback["state"])
+    else:
+        code = args.code
+        verifier = args.code_verifier
+    token = exchange_code(env, code, verifier)
     save_token(token)
     print(f"Saved token to {TOKEN_PATH}")
 
@@ -278,6 +324,7 @@ def main() -> int:
     group = exchange_parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--code")
     group.add_argument("--callback-url")
+    exchange_parser.add_argument("--code-verifier")
     exchange_parser.set_defaults(func=command_exchange)
 
     refresh_parser = sub.add_parser("refresh", help="Refresh saved access token.")

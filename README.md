@@ -60,6 +60,9 @@ The helper uses Oura's OAuth issuer discovery document by default. If Oura
 changes endpoints again, override with `OURA_AUTHORIZE_URL` and
 `OURA_TOKEN_URL`.
 
+Authorization URLs include PKCE. The helper stores the temporary verifier in
+`data/tokens/oura_oauth_state.json`, which is ignored by git.
+
 If the browser runs on the same machine:
 
 ```bash
